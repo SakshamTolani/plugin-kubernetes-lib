@@ -1,5 +1,6 @@
 package io.kestra.plugin.kubernetes.shared.services;
 
+import static org.hamcrest.Matchers.containsString;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,6 +15,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 import org.slf4j.Logger;
 
+import io.kestra.core.models.tasks.runners.AbstractLogConsumer;
+import io.kestra.core.models.tasks.runners.TaskException;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.runners.WorkingDir;
 
@@ -559,5 +562,34 @@ class PodServiceTest {
         PodService.uploadMarker(runContext, podResource, logger, "ready", "container");
 
         assertFalse(Files.exists(staleMarkerFile), "the stale marker file must be cleaned up so the next run can create it again");
+    }
+
+    @Test
+    void checkContainerFailuresShouldPreserveContainerExitCode() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(137)
+            .withReason("Error")
+            .withMessage("Container process failed")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var logger = mock(Logger.class);
+        var logConsumer = mock(AbstractLogConsumer.class);
+
+        var exception = assertThrows(
+            TaskException.class,
+            () -> PodService.checkContainerFailures(pod, null, logger, logConsumer)
+        );
+
+        assertThat(exception.getExitCode(), is(137));
+        assertThat(exception.getMessage(), containsString("Container 'main' failed with exit code 137"));
     }
 }
