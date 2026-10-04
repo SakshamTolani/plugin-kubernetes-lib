@@ -825,7 +825,7 @@ class PodServiceTest {
 
         assertThat(message, containsString("exitcode '137', container 'main', reason 'Error'"));
         assertThat(message, containsString("disruption 'EvictionByEvictionAPI'"));
-        assertThat(message, containsString("SIGKILL not caused by the memory limit"));
+        assertThat(message, containsString("(exit code 137 means the process received SIGKILL; possible causes: OOM kill of a child process"));
     }
 
     @Test
@@ -849,7 +849,7 @@ class PodServiceTest {
 
         var message = PodService.failedMessage(pod).getMessage();
 
-        assertThat(message, containsString("pod reason 'Evicted': The node was low on resource: memory."));
+        assertThat(message, containsString("pod reason 'Evicted', pod message 'The node was low on resource: memory.'"));
     }
 
     @Test
@@ -905,6 +905,155 @@ class PodServiceTest {
             () -> PodService.checkContainerFailures(pod, "out-files", mock(Logger.class))
         );
 
-        assertThat(exception.getMessage(), is("Container 'main' failed with exit code 137, reason: OOMKilled, memory limit '64Mi'"));
+        assertThat(exception.getMessage(), is("Container 'main' failed with exit code 137, reason: OOMKilled, memory limit: 64Mi"));
+    }
+
+    @Test
+    void failedMessageShouldNotAddSigkillHintWhenOomKilled() {
+        var pod = new PodBuilder()
+            .withNewSpec()
+            .addNewContainer()
+            .withName("main")
+            .withNewResources()
+            .addToLimits("memory", new Quantity("64Mi"))
+            .endResources()
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(137)
+            .withReason("OOMKilled")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var message = PodService.failedMessage(pod).getMessage();
+
+        assertThat(message, not(containsString("SIGKILL")));
+    }
+
+    @Test
+    void failedMessageShouldIgnoreDisruptionTargetThatIsNotTrue() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewCondition()
+            .withType("DisruptionTarget")
+            .withStatus("False")
+            .withReason("EvictionByEvictionAPI")
+            .endCondition()
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(1)
+            .withReason("Error")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var message = PodService.failedMessage(pod).getMessage();
+
+        assertThat(message, is("Pods terminated with status 'Failed', exitcode '1', container 'main', reason 'Error'"));
+    }
+
+    @Test
+    void failedMessageShouldOmitMemoryLimitWhenPodHasNoSpec() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(137)
+            .withReason("OOMKilled")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var message = PodService.failedMessage(pod).getMessage();
+
+        assertThat(message, is("Pods terminated with status 'Failed', exitcode '137', container 'main', reason 'OOMKilled'"));
+    }
+
+    @Test
+    void failedMessageShouldOmitMemoryLimitWhenNoSpecContainerMatches() {
+        var pod = new PodBuilder()
+            .withNewSpec()
+            .addNewContainer()
+            .withName("other")
+            .withNewResources()
+            .addToLimits("memory", new Quantity("64Mi"))
+            .endResources()
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(137)
+            .withReason("OOMKilled")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var message = PodService.failedMessage(pod).getMessage();
+
+        assertThat(message, is("Pods terminated with status 'Failed', exitcode '137', container 'main', reason 'OOMKilled'"));
+    }
+
+    @Test
+    void failedMessageShouldReportPodReasonWhenEvictedBeforeAnyContainerStarted() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .withReason("Evicted")
+            .withMessage("The node was low on resource: ephemeral-storage.")
+            .endStatus()
+            .build();
+
+        var message = PodService.failedMessage(pod).getMessage();
+
+        assertThat(message, is("Pod failed with phase 'Failed', pod reason 'Evicted', pod message 'The node was low on resource: ephemeral-storage.'"));
+    }
+
+    @Test
+    void checkContainerFailuresShouldAddSigkillHintWhenNotOomKilled() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(137)
+            .withReason("Error")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var exception = assertThrows(
+            IllegalStateException.class,
+            () -> PodService.checkContainerFailures(pod, "out-files", mock(Logger.class))
+        );
+
+        assertThat(exception.getMessage(), is("Container 'main' failed with exit code 137, reason: Error (exit code 137 means the process received SIGKILL; possible causes: OOM kill of a child process, eviction, node shutdown or pod deletion)"));
     }
 }
