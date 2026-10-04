@@ -50,6 +50,9 @@ public final class PodService {
 
     private static final List<String> COMPLETED_PHASES = List.of(PodPhase.SUCCEEDED.value(), PodPhase.FAILED.value(), PodPhase.UNKNOWN.value()); // see https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
     private static final String SIDECAR_FILES_CONTAINER_NAME = "out-files";
+    private static final String OOM_KILLED_REASON = "OOMKilled";
+    private static final String DISRUPTION_TARGET_CONDITION = "DisruptionTarget";
+    private static final int SIGKILL_EXIT_CODE = 137;
 
     // EE's marker for "upload the whole working directory" in uploadInputFiles — see its Javadoc.
     private static final Path EMPTY_RELATIVE_PATH = Path.of("");
@@ -274,19 +277,23 @@ public final class PodService {
     }
 
     static Optional<ContainerStateTerminated> firstFailingOrFirstTerminated(Pod pod) {
+        return firstFailingOrFirstTerminatedStatus(pod).map(containerStatus -> containerStatus.getState().getTerminated());
+    }
+
+    private static Optional<ContainerStatus> firstFailingOrFirstTerminatedStatus(Pod pod) {
         if (pod == null || pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
             return Optional.empty();
         }
 
         var terminated = pod.getStatus().getContainerStatuses().stream()
-            .map(ContainerStatus::getState)
-            .filter(Objects::nonNull)
-            .map(ContainerState::getTerminated)
-            .filter(Objects::nonNull)
+            .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
             .toList();
 
         return terminated.stream()
-            .filter(c -> c.getExitCode() != null && c.getExitCode() != 0)
+            .filter(containerStatus -> {
+                Integer exitCode = containerStatus.getState().getTerminated().getExitCode();
+                return exitCode != null && exitCode != 0;
+            })
             .findFirst()
             .or(() -> terminated.stream().findFirst());
     }
@@ -303,14 +310,23 @@ public final class PodService {
             return new IllegalStateException("Pods terminated without any status !");
         }
 
-        return firstFailingOrFirstTerminated(pod)
-            .map(
-                containerStateTerminated -> new IllegalStateException(
+        return firstFailingOrFirstTerminatedStatus(pod)
+            .map(containerStatus -> {
+                ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
+                List<String> details = new ArrayList<>();
+                details.add("container '" + containerStatus.getName() + "'");
+                if (terminated.getReason() != null) {
+                    details.add("reason '" + terminated.getReason() + "'");
+                }
+                details.addAll(terminationDetails(pod, containerStatus));
+
+                return new IllegalStateException(
                     "Pods terminated with status '" + pod.getStatus().getPhase() + "', " +
-                        "exitcode '" + containerStateTerminated.getExitCode() + "' & " +
-                        "message '" + containerStateTerminated.getMessage() + "'"
-                )
-            )
+                        "exitcode '" + terminated.getExitCode() + "'" +
+                        (terminated.getMessage() != null ? " & message '" + terminated.getMessage() + "'" : "") +
+                        ", " + String.join(", ", details)
+                );
+            })
             .orElseGet(() ->
             {
                 if (pod.getStatus().getContainerStatuses() != null) {
@@ -337,7 +353,7 @@ public final class PodService {
             return;
         }
 
-        String errorMsg = containerFailureMessage(failed.get());
+        String errorMsg = containerFailureMessage(pod, failed.get());
         logger.error(errorMsg);
         throw new IllegalStateException(errorMsg);
     }
@@ -353,7 +369,7 @@ public final class PodService {
         }
 
         var terminated = failed.get().getState().getTerminated();
-        var errorMsg = containerFailureMessage(failed.get());
+        var errorMsg = containerFailureMessage(pod, failed.get());
         var exitCode = terminated != null ? terminated.getExitCode() : -1;
         logger.error(errorMsg);
         throw new TaskException(errorMsg, exitCode, defaultLogConsumer);
@@ -371,12 +387,70 @@ public final class PodService {
             .findFirst();
     }
 
-    private static String containerFailureMessage(ContainerStatus containerStatus) {
+    private static String containerFailureMessage(Pod pod, ContainerStatus containerStatus) {
         ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
+        List<String> details = terminationDetails(pod, containerStatus);
         return "Container '" + containerStatus.getName() + "' failed with exit code " +
             terminated.getExitCode() +
             (terminated.getReason() != null ? ", reason: " + terminated.getReason() : "") +
-            (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "");
+            (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "") +
+            (details.isEmpty() ? "" : ", " + String.join(", ", details));
+    }
+
+    /**
+     * Explains why a terminated container stopped, beyond its exit code: the memory limit it hit,
+     * the signal, and whether the pod itself was evicted or disrupted. Every part is optional, so
+     * fields an older cluster does not set (e.g. the DisruptionTarget condition before 1.26) are skipped.
+     */
+    private static List<String> terminationDetails(Pod pod, ContainerStatus containerStatus) {
+        ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
+        List<String> details = new ArrayList<>();
+
+        boolean oomKilled = OOM_KILLED_REASON.equals(terminated.getReason());
+        if (oomKilled) {
+            memoryLimit(pod, containerStatus.getName()).ifPresent(limit -> details.add("memory limit '" + limit + "'"));
+        }
+        if (terminated.getSignal() != null) {
+            details.add("signal '" + terminated.getSignal() + "'");
+        }
+        if (pod.getStatus() != null && pod.getStatus().getReason() != null) {
+            details.add(
+                "pod reason '" + pod.getStatus().getReason() + "'" +
+                    (pod.getStatus().getMessage() != null ? ": " + pod.getStatus().getMessage() : "")
+            );
+        }
+        disruptionReason(pod).ifPresent(reason -> details.add("disruption '" + reason + "'"));
+        if (!oomKilled && Integer.valueOf(SIGKILL_EXIT_CODE).equals(terminated.getExitCode())) {
+            details.add("SIGKILL not caused by the memory limit (e.g. eviction, node shutdown or pod deletion)");
+        }
+
+        return details;
+    }
+
+    private static Optional<String> memoryLimit(Pod pod, String containerName) {
+        if (pod.getSpec() == null || pod.getSpec().getContainers() == null) {
+            return Optional.empty();
+        }
+
+        return pod.getSpec().getContainers().stream()
+            .filter(container -> Objects.equals(container.getName(), containerName))
+            .findFirst()
+            .map(Container::getResources)
+            .map(ResourceRequirements::getLimits)
+            .map(limits -> limits.get("memory"))
+            .map(Quantity::toString);
+    }
+
+    private static Optional<String> disruptionReason(Pod pod) {
+        if (pod.getStatus() == null || pod.getStatus().getConditions() == null) {
+            return Optional.empty();
+        }
+
+        return pod.getStatus().getConditions().stream()
+            .filter(condition -> DISRUPTION_TARGET_CONDITION.equals(condition.getType()) && "True".equals(condition.getStatus()))
+            .map(PodCondition::getReason)
+            .filter(Objects::nonNull)
+            .findFirst();
     }
 
     public static PodResource podRef(KubernetesClient client, Pod pod) {
