@@ -291,7 +291,7 @@ public final class PodService {
 
         return terminated.stream()
             .filter(containerStatus -> {
-                Integer exitCode = containerStatus.getState().getTerminated().getExitCode();
+                var exitCode = containerStatus.getState().getTerminated().getExitCode();
                 return exitCode != null && exitCode != 0;
             })
             .findFirst()
